@@ -1,3 +1,4 @@
+from ghidra.program.model.mem import MemoryAccessException
 from ghidra.program.model.pcode import PcodeOp, VarnodeTranslator
 from ghidra.program.model.address import GenericAddress
 from ghidra.program.flatapi import FlatProgramAPI
@@ -8,7 +9,12 @@ import struct as st
 
 from __main__ import currentProgram
 
-BINARY_PCODE_OPS = [PcodeOp.INT_ADD, PcodeOp.PTRSUB, PcodeOp.INT_SUB, PcodeOp.INT_MULT]
+BINARY_PCODE_OPS = {
+    PcodeOp.INT_ADD: '+', 
+    PcodeOp.PTRSUB: '+', 
+    PcodeOp.INT_SUB: '-', 
+    PcodeOp.INT_MULT: '*'
+}
 
 space_ram = None
 space_uniq = None
@@ -81,31 +87,23 @@ def get_pcode_value(pcode):
         if op1 is None or op2 is None:
             return None
 
-        # TODO: change this !
-        cast_to_str = False
+        oper = BINARY_PCODE_OPS[opcode]
 
-        if type(op1) == unicode or type(op2) == unicode or type(op1) == str or type(op2) == str:
+        # get_varnode_value can return an integer or a string
+        if type(op1) == str or type(op2) == str or type(op1) == unicode or type(op2) == unicode:
             op1 = str(op1)
             op2 = str(op2)
-            cast_to_str = True
 
-        if opcode == PcodeOp.INT_ADD or opcode == PcodeOp.PTRSUB:
-            if cast_to_str:
-                if '-' in op2:
-                    return op1 + op2
-                else:
-                    return '%s+%s' % (op1, op2)
-            return op1 + op2
+            if '+' in op1 and op2.isdigit():
+                op1, op3 = tuple(op1.split('+'))
+                op2 = eval('%s %s %s' % (op3, oper, op2))
+            elif '-' in op1 and op2.isdigit():
+                op1, op3 = op1[:op1.index('-')], op1[op1.index('-')+1:]
+                op2 = eval('%s %s %s' % (op3, oper, op2))
 
-        elif opcode == PcodeOp.INT_MULT:
-            if cast_to_str:
-                return '%s*%s' % (op1, op2)
-            return op1 * op2
-
-        elif opcode == PcodeOp.INT_SUB:
-            if cast_to_str:
-                return '%s-%s' % (op1, op2)
-            return op1 - op2
+            return '%s%s%s' % (op1, oper, op2)
+        else:
+            return eval('%d %s %d' % (op1, oper, op2))
 
     elif opcode == PcodeOp.PTRADD:
         op1 = get_varnode_value(pcode.getInput(0))
@@ -151,7 +149,7 @@ def get_pcode_value(pcode):
 
     elif opcode == PcodeOp.LOAD:
         off = get_varnode_value(pcode.getInput(1))
-        if off is None:
+        if off is None or type(off) == str:
             return None
 
         addr = fp.toAddr(off)
@@ -164,7 +162,10 @@ def get_pcode_value(pcode):
         # Right now, we're only handling loads from RAM
 
         if space_ram is not None and space == space_ram:
-            return get_value_from_addr(addr, pcode.output.size)
+            try:
+                return get_value_from_addr(addr, pcode.output.size)
+            except MemoryAccessException:
+                return None
         else:
             #print('Unhandled load space %d for pcode %s' % (space, pcode))
             return None
@@ -204,14 +205,14 @@ def get_varnode_value(varnode):
             return get_value_from_addr(addr, varnode.size)
         return None
 
-    if space_name in name2space and offset in name2space[space_name]:
+    if space_name in name2space and offset in name2space[space_name] and name2space[space_name][offset] is not None:
         return name2space[space_name][offset]
 
     if space_name == 'register':
         translator = VarnodeTranslator(cp)
         reg = translator.getRegister(varnode)
         if reg is not None:
-            return reg.name
+            return str(reg.name)
 
     else:
         # NOTE: It looks like definition is always null without the decompiler? Investigate, Sam. Just kidding, I know

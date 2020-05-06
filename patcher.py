@@ -1,13 +1,9 @@
-from ghidra.app.plugin.assembler import Assemblers
 from ghidra.program.flatapi import FlatProgramAPI
 
 import binascii
 import subprocess
 
 from __main__ import currentProgram
-
-#import binascii
-#load_code = binascii.unhexlify('5756505f488d35e8ffffffe8aaf433015e5f')
 
 # TODO: change call strcpy address to be resolved dynamically
 load_asm_header = [
@@ -40,10 +36,15 @@ def generate_asm(ss, reg, off, call_addr):
         footer = ['POP RAX']
     else:
         #header = ['LEA RDI, [%s + %s]' % (reg, hex(off))]
+        '''
         header = [
             'PUSH %s' % reg,
             'POP RDI',
             'ADD RDI, %s' % hex(off)
+        ]
+        '''
+        header = [
+            'LEA RDI, [%s + %s]' % (reg, hex(off))
         ]
         footer = ['POP RAX']
 
@@ -58,7 +59,6 @@ def generate_asm(ss, reg, off, call_addr):
 
 
 def assemble_insn(insn, at=None):
-    # TODO: try clearing the listing and assembling -- should get rid of the context that's borking us
     args = ['rasm2', '-a', 'x86', '-b', '64']
 
     if at is not None:
@@ -94,16 +94,19 @@ def get_load_bytes(asm, start):
 
 
 def patch(bs, off):
-    # I hate python2
-    #assembler.patchProgram(bytes(bytearray(bs)), fp.toAddr(off))
+    # Clear the bytes first
     fp.clearListing(fp.toAddr(off), fp.toAddr(off + len(bs)))
+
+    # Enable writing for the section
     text_blk.setWrite(True)
+    # I hate python2
     text_blk.putBytes(fp.toAddr(off), bytes(bytearray(bs)))
+
+    # Restore the the permissions
     text_blk.setWrite(False)
 
 
 cp = currentProgram
 fp = FlatProgramAPI(cp)
-assembler = Assemblers.getAssembler(cp.language)
 
 text_blk = [blk for blk in cp.memory.blocks if blk.name == '__text'][0]
