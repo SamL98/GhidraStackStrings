@@ -113,6 +113,22 @@ def handle_copy(pc):
     set_varnode_value(output, bs)
 
 
+def split_vnode_str(dst):
+    reg, off = None, 0
+
+    try:
+        if '+' in dst:
+            reg, off = dst.split('+')
+            off = int(off)
+        else:
+            reg = dst
+            off = 0
+    except ValueError:
+        return None, None
+
+    return reg, off
+
+
 def handle_store(pc):
     global found_ss, ss_insns, ss_reg, ss_off, ss, stack_strings
 
@@ -126,17 +142,8 @@ def handle_store(pc):
     if src == 0:
         src = '\x00'
 
-    reg, off = None, 0
-
-    try:
-        if '+' in dst:
-            reg, off = dst.split('+')
-            off = int(off)
-        else:
-            reg = dst
-            off = 0
-    except ValueError:
-        print('Exception splitting %s for %s' % (dst, src))
+    reg, off = split_vnode_str(dst)
+    if reg is None or off is None:
         clear_varnodes()
         return
 
@@ -200,6 +207,8 @@ while insn is not None and fp.getFunctionContaining(insn.address) == cont_fn:
     insn = insn.next
 
 
+clear_varnodes()
+
 namespace_man = cp.namespaceManager
 strcpy = None
 
@@ -249,47 +258,53 @@ for ss, ss_info in stack_strings.items():
             print('Can\'t deoptimize %s' % ss)
             continue
 
-        # emulate all the pcode
-        for pc in pcode:
+        from pcode_utils import name2space
+
+        # emulate all the pcode up until the store
+        for pc in pcode[:-1]:
             output = pc.output
             value = get_pcode_value(pc)
 
             if output is not None and type(output) != str:
                 set_varnode_value(output, value)
 
-            # this mean's that we've accessed a register. hopefully it's out stack string register
-            if type(value) == str:
-                reg, off = None, 0
+        pc = pcode[-1]
+        dst = get_varnode_value(pc.getInput(1))
 
-                try:
-                    if '+' in value:
-                        reg, off = value.split('+')
-                        off = int(off)
-                    else:
-                        reg = value
-                        off = 0
-                except ValueError:
-                    continue
+        # this mean's that we've accessed a register. hopefully it's out stack string register
+        if type(dst) != str:
+            print('Can\'t deoptimize %s: %s not a string' % (ss[:-1], dst))
+            continue
 
-                overlap = get_intersection(ss, '', ss_info['off'], off)
-                if overlap >= 0:
-                    # this means that we've written to an overlapping region from our ss register
-                    # relocate all of our blocks backwards
-                    ss_info['start'] -= insn.length
-                    blocks = get_load_bytes(asm, ss_info['start'])
+        reg, off = split_vnode_str(dst)
+        if reg is None or off is None:
+            print('Can\'t deoptimize %s: can\'t parse reg/off' % ss[:-1])
+            continue
 
-                    max_nb = ss_info['end'] - ss_info['start'] - len(ss)
-                    nb = sum([len(block[1]) for block in blocks])
+        # make sure that the store is touching the stack string
+        if min(ss_info['off'] + len(ss), off) - max(ss_info['off'], off) < 0:
+            # if we've reached here, it means we're at the end of our rope. no mas.
+            print('Can\'t deoptimize %s: no overlap' % ss[:-1])
+            continue
 
-                    if nb > max_nb:
-                        print('Couldn\'t deoptimize %s' % ss)
-                        continue
+        # this means that we've written to an overlapping region from our ss register
+        # relocate all of our blocks backwards
+        ss_info['start'] -= insn.length
+        blocks = get_load_bytes(asm, ss_info['start'])
+
+        max_nb = ss_info['end'] - ss_info['start'] - len(ss)
+        nb = sum([len(block[1]) for block in blocks])
+
+        # we found a lil cushion... but is it enough?
+        if nb > max_nb:
+            print('Couldn\'t deoptimize %s' % ss[:-1])
+            continue
 
     if nb < max_nb:
         # fill the rest with nops
         blocks[1] = (blocks[1][0], blocks[1][1] + ([0x90] * (max_nb - nb)))
 
-    print(ss)
+    print(ss[:-1])
 
     for off, bs in blocks:
         patch(bs, off)
