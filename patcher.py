@@ -18,14 +18,16 @@ load_asm_footer = [
 ]
 
 def generate_asm(ss, reg, off, call_addr):
-    asm = [
+    asm = [i for i in load_asm_header]
+
+    asm.extend([
         #'PUSH 0x9',
         #'POP RSI',
         'LEA RSI, [0x9]',
         'JMP %s' % hex(len(ss) + 2)
-    ]
+    ])
 
-    asm.extend(load_asm_header)
+    #asm.extend(load_asm_header)
 
     header, footer = [], []
 
@@ -76,16 +78,20 @@ def get_load_bytes(asm, start):
     curr_off = start
     jmp_off = curr_off
 
-    jmp_bs = assemble_insn(asm[0])
-    #jmp_bs.extend(assemble_insn(asm[1]))
-    curr_off += len(jmp_bs)
+    jmp_bs = []
+    #jmp_bs = assemble_insn(asm[0])
 
-    jmp_bs.extend(assemble_insn(asm[1]))
+    for i in range(4):
+        curr_bs = assemble_insn(asm[i])
+        jmp_bs.extend(curr_bs)
+        curr_off += len(curr_bs)
+
+    jmp_bs.extend(assemble_insn(asm[4]))
     curr_off += jmp_bs[-1] + 2
 
     main_off = curr_off
 
-    for line in asm[2:]:
+    for line in asm[5:]:
         insn_bs = assemble_insn(line, curr_off)
         bs.extend(insn_bs)
         curr_off += len(insn_bs)
