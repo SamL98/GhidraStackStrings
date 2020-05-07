@@ -18,6 +18,8 @@ This project has dependencies?! Yep. Ghidra's built-in assembler kept yelling at
 
 Most of this code was hacked together at the wee hours of the night. Therefore, let's just say it's not production quality. There's also some hacks in the code that were specific to the binary I was looking at while developing this. I don't think it's gonna hurt on other binaries (y'never know) but it's unnecessary nonetheless.
 
+Yoour binary also needs `strcpy` for the script to work.
+
 ## Usage
 
 Copy all the scripts to `~/ghidra_scripts` or add this directory to the Ghidra script search paths. Then run `deoptimizer.py`.
