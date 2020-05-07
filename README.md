@@ -4,11 +4,11 @@ This project provides a first-pass hack for getting stack strings to display in 
 
 Here's an example of the results:
 
-[orig](/images/orig.png)
+![orig](/images/orig.png)
 
 to
 
-[new](/images/new.png)
+![new](/images/new.png)
 
 ## Dependencies
 
