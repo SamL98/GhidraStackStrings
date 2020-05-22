@@ -10,6 +10,8 @@ to
 
 ![new](/images/new.png)
 
+The methodology is detailed in [here](https://saml98.github.io/jekyll/update/2020/05/03/ghidra-stack-strings.html)
+
 ## Dependencies
 
 This project has dependencies?! Yep. Ghidra's built-in assembler kept yelling at me so at 2am, I decided to give up and call `rasm2` as a subprocess. So yeah. You're gonna need radare2. Or some familiarity with the Ghidra API.
