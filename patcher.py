@@ -21,13 +21,9 @@ def generate_asm(ss, reg, off, call_addr):
     asm = [i for i in load_asm_header]
 
     asm.extend([
-        #'PUSH 0x9',
-        #'POP RSI',
         'LEA RSI, [0x9]',
         'JMP %s' % hex(len(ss) + 2)
     ])
-
-    #asm.extend(load_asm_header)
 
     header, footer = [], []
 
@@ -37,14 +33,6 @@ def generate_asm(ss, reg, off, call_addr):
         header = ['PUSH %s' % reg, 'POP RDI']
         footer = ['POP RAX']
     else:
-        #header = ['LEA RDI, [%s + %s]' % (reg, hex(off))]
-        '''
-        header = [
-            'PUSH %s' % reg,
-            'POP RDI',
-            'ADD RDI, %s' % hex(off)
-        ]
-        '''
         header = [
             'LEA RDI, [%s + %s]' % (reg, hex(off))
         ]
@@ -65,7 +53,6 @@ def assemble_insn(insn, at=None):
 
     if at is not None:
         args.extend(['-@', hex(at)])
-        #print('Assembling %s at %s' % (insn, hex(at)))
 
     args.append(insn)
     out = subprocess.check_output(args).strip()
@@ -79,7 +66,6 @@ def get_load_bytes(asm, start):
     jmp_off = curr_off
 
     jmp_bs = []
-    #jmp_bs = assemble_insn(asm[0])
 
     for i in range(4):
         curr_bs = assemble_insn(asm[i])
@@ -105,6 +91,7 @@ def patch(bs, off):
 
     # Enable writing for the section
     text_blk.setWrite(True)
+
     # I hate python2
     text_blk.putBytes(fp.toAddr(off), bytes(bytearray(bs)))
 

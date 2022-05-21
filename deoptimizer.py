@@ -12,7 +12,7 @@ import math
 import string
 import struct as st
 
-from pcode_utils import *
+from my_pcode_utils import *
 from patcher import *
 
 def get_intersection(s1, s2, s1_off, s2_off):
@@ -246,6 +246,9 @@ for ss, ss_info in stack_strings.items():
     nb = sum([len(block[1]) for block in blocks])
 
     if nb > max_nb:
+        print('Need %d bytes but only have %d' % (nb, max_nb))
+        print(hex(ss_info['start']), hex(ss_info['end']))
+
         # this is suuuuper hacky but if we don't have enough bytes, search the instruction before
         # our stack string moving block since it might be moving a null-terminator.
         #
@@ -257,8 +260,6 @@ for ss, ss_info in stack_strings.items():
         if pcode[-1].opcode != PcodeOp.STORE:
             print('Can\'t deoptimize %s' % ss)
             continue
-
-        from pcode_utils import name2space
 
         # emulate all the pcode up until the store
         for pc in pcode[:-1]:
