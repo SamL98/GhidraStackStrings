@@ -1,324 +1,206 @@
-from ghidra.program.flatapi import FlatProgramAPI
-from ghidra.program.model.pcode import PcodeOp
-from ghidra.util.task import TaskMonitor
+from ghidra.program.model.listing import ParameterImpl, FlowOverride
+from ghidra.program.model.listing.Function import FunctionUpdateType
+from ghidra.program.model.data import PointerDataType, CharDataType
+from ghidra.program.model.lang import PrototypeModel, Register
+from ghidra.program.model.block import BasicBlockModel
 from ghidra.program.model.address import AddressSet
 from ghidra.program.model.symbol import SourceType
-from ghidra.program.model.data import PointerDataType, CharDataType
-from ghidra.program.model.listing import ParameterImpl
-from ghidra.program.model.listing.Function import FunctionUpdateType
-from ghidra.program.model.lang import PrototypeModel
+from ghidra.program.flatapi import FlatProgramAPI
+from ghidra.program.model.scalar import Scalar
+from ghidra.util.task import TaskMonitor
 
-import math
-import string
 import struct as st
+import atexit
+import string
+import math
 
-from my_pcode_utils import *
-from patcher import *
-
-def get_intersection(s1, s2, s1_off, s2_off):
-    if s2_off < s1_off:
-        s1, s2 = s2, s1
-        s1_off, s2_off = s2_off, s1_off
-
-    return s2_off - (s1_off + len(s1))
-
-def merge(s1, s2, s1_off, s2_off):
-    if s2_off < s1_off:
-        s1, s2 = s2, s1
-        s1_off, s2_off = s2_off, s1_off
-
-    overlap = get_intersection(s1, s2, s1_off, s2_off)
-    return s1[:len(s1) + min(overlap, 0)] + s2
-
-def merge_insns(all_insns, new_insn):
-    o = new_insn.address.offset
-    l = new_insn.length
-    e = o + l
-
-    for i, (start, end) in enumerate(all_insns):
-        if min(e, end) - max(o, start) >= 0:
-            all_insns[i] = (min(o, start), max(e, end))
-            return all_insns
-
-    # this means we didn't have a matching block
-    all_insns.append((o, e))
-    all_insns = sorted(all_insns, key=lambda i: i[0])
-    return all_insns
+from emulator_utils import *
+from asm_utils import *
 
 
-ca = currentAddress
-cp = currentProgram
-fp = FlatProgramAPI(cp)
+def getBasicBlocks(func):
+    bbm = BasicBlockModel(currentProgram)
+    buf = bbm.getCodeBlocksContaining(func.entryPoint, TaskMonitor.DUMMY)
+    visited = set()
+    blocks = []
 
-fn = fp.getFunctionContaining(ca)
-cont_fn = fn
+    while len(buf) > 0:
+        block = buf.pop(0)
 
-if fn is None:
-    print('Could not get function containing %x' % ca.offset)
-    exit()
+        if block not in visited and getFunctionContaining(block.minAddress) == func:
+            #print(block.minAddress)
+            blocks.append(block)
+            visited.add(block)
 
-entry = fn.getEntryPoint()
-insn = fp.getInstructionAt(entry)
+            iter = block.getDestinations(TaskMonitor.DUMMY)
 
-found_ss = False
-ss_reg, ss_off = None, 0
-ss = ''
+            while iter.hasNext():
+                buf.append(iter.next().destinationBlock)
 
-# It's hacky that we keep a list of instruction blocks, but our heuristic for finding stack string COPY's
-# isn't perfect so we'll just pick the larget one once we're done.
-ss_insns = []
+    return blocks
 
-stack_strings = {}
+class Buffer(object):
+    def __init__(self, addr, size):
+        self.start = addr
+        self.end = addr.add(size)
+        self.size = size
+        self.reg = None
+        self.off = 1000000
+        self.write_start = 0xffffffffffffffff
+        self.write_end = 0x0
 
-# *********************************************************************************************
-# TODO: Try just emulating the whole function and picking out strings from the resulting memory
-# *********************************************************************************************
+class StackString(object):
+    def __init__(self, value, reg, off, write_start, write_end):
+        self.value = value
+        self.reg = reg
+        self.off = off
+        self.write_start = write_start
+        self.write_end = write_end
 
-def handle_copy(pc):
-    global found_ss, ss_insns
+class Heap(object):
+    def __init__(self, head):
+        self.head = head
 
-    inpt = pc.getInput(0)
+    def alloc(self, size):
+        ptr = self.head
+        self.head += size
+        return ptr
 
-    lb = 4
-    if found_ss:
-        lb = 2
+def getStackStrings():
+    func = getFunctionContaining(currentAddress)
+    blocks = getBasicBlocks(func)
 
-    if inpt.size < lb or inpt.getAddress().addressSpace.name != 'const':
-        return
+    heap = Heap(0x80000000)
+    bufs = []
+    stackStrings = []
 
-    bs = vnode2bytes(inpt)
-    if bs is None:
-        return
+    def handle_write(addr, size, val, pc, emu=None):
+        #if sum([b in string.printable for b in val.decode('utf-8')]) / float(len(val)) < 0.5:
+        #    return
 
-    nprintable = len([b for b in bs if b in string.printable])
-    if nprintable / float(len(bs)) < 0.5:
-        return
+        for buf in bufs:
+            if buf.start <= addr and addr <= buf.end:
+                buf.write_start = min(buf.write_start, pc)
+                buf.write_end   = max(buf.write_end  , pc)
 
-    if len(bs) < inpt.size:
-        if not found_ss:
-            return
+                insn = getInstructionAt(toAddr(pc))
 
-        bs += '\x00' * (inpt.size - len(bs))
+                for i in range(insn.numOperands):
+                    if insn.getOperandRefType(i).isWrite():
+                        objs = insn.getOpObjects(i)
 
-    # Now that we've passed all the prerequisite checks, assume that we've found a stack string
-    found_ss = True
+                        for obj in objs:
+                            if isinstance(obj, Register):
+                                buf.reg = obj
+                            elif isinstance(obj, Scalar):
+                                buf.off = min(buf.off, obj.unsignedValue)
 
-    if len(ss_insns) == 0:
-        ss_insns = [(insn.address.offset, insn.address.offset + insn.length)]
-    else:
-        ss_insns = merge_insns(ss_insns, insn)
+    def malloc(size, *args, **kwargs):
+        ptr = heap.alloc(size)
 
-    # Put our string into its address space
-    output = pc.output
-    set_varnode_value(output, bs)
+        if size > 0:
+            addr = toAddr(ptr)
+            bufs.append(Buffer(addr, size))
 
+            if 'emu' in kwargs:
+                #print('Allocated 0x%x bytes to %s @ %s' % (size, addr, toAddr(kwargs['emu'].get_pc())))
+                watch(addr, size, handler=handle_write, emu=kwargs['emu'])
 
-def split_vnode_str(dst):
-    reg, off = None, 0
+        return ptr
 
-    try:
-        if '+' in dst:
-            reg, off = dst.split('+')
-            off = int(off)
-        else:
-            reg = dst
-            off = 0
-    except ValueError:
-        return None, None
+    for block in blocks:
+        bufs = []
 
-    return reg, off
+        #print('Emulating block %s - %s' % (block.minAddress, block.maxAddress))
+        cpuState = emulate(block.minAddress,
+                           block.maxAddress,
+                           hooks={'operator.new': malloc},
+                           skip_calls=True)
 
+        for buf in bufs:
+            try:
+                contents = cpuState.read(buf.start, buf.size).decode('utf-8')
+            except UnicodeDecodeError:
+                continue
 
-def handle_store(pc):
-    global found_ss, ss_insns, ss_reg, ss_off, ss, stack_strings
+            for i, b in enumerate(contents):
+                if b == u'\x00':
+                    value = contents[:i+1]
 
-    dst = get_varnode_value(pc.getInput(1))
-    src = get_varnode_value(pc.getInput(2))
+                    if len(value) > 8:
+                        # Fixup the write start assuming the instructions are contiguous.
+                        buf.write_start = getInstructionBefore(toAddr(buf.write_start)).address.offset
+                        buf.write_end += getInstructionAt(toAddr(buf.write_end)).length
 
-    if src is None or dst is None or not found_ss or (type(src) != str and src > 0) or type(dst) != str:
-        clear_varnodes()
-        return
+                        print('Found stack string "%s" written to (%s, 0x%x) from %s - %s' % (value, buf.reg, buf.off, toAddr(buf.write_start), toAddr(buf.write_end)))
+                        stackString = StackString(value, buf.reg, buf.off, buf.write_start, buf.write_end)
+                        stackStrings.append(stackString)
 
-    if src == 0:
-        src = '\x00'
+                if b not in string.printable:
+                    break
 
-    reg, off = split_vnode_str(dst)
-    if reg is None or off is None:
-        clear_varnodes()
-        return
-
-    if ss_reg is None:
-        ss_reg = reg
-        ss_off = off
-        ss = src
-    elif min(ss_off + len(ss), off + len(src)) - max(ss_off, off) < 0:
-        clear_varnodes()
-        return
-
-    ss = merge(ss, src, ss_off, off)
-    ss_off = min(ss_off, off)
-    ss_insns = merge_insns(ss_insns, insn)
-
-    if '\x00' not in ss:
-        return
-
-    if len(ss) > 1:
-        max_s, max_e = 0, 0
-
-        for s, e in ss_insns:
-            if e-s > max_s-max_e:
-                max_s, max_e = s, e
-
-        stack_strings[ss] = {
-            'start': max_s,
-            'end': max_e,
-            'reg': ss_reg,
-            'off': ss_off
-        }
-
-    found_ss = False
-    ss_reg = None
-    ss_off = 0
-    ss = ''
-    ss_insns = []
-
-    clear_varnodes()
-
-while insn is not None and fp.getFunctionContaining(insn.address) == cont_fn:
-    pcode = insn.pcode
-
-    for pc in pcode:
-        # TODO: Change this so we're only emulating pcode we care about. Would work if varnode.getDef()
-        #       worked outside the context of the decompiler. Meh.
-        output = pc.output
-        value = get_pcode_value(pc)
-
-        if pc.opcode == PcodeOp.STORE and not found_ss:
-            clear_varnodes()
-
-        if output is not None and type(output) != str:
-            set_varnode_value(output, value)
-
-        if pc.opcode == PcodeOp.COPY:
-            handle_copy(pc)
-        elif pc.opcode == PcodeOp.STORE and found_ss:
-            handle_store(pc)
-
-    insn = insn.next
+    return stackStrings
 
 
-clear_varnodes()
-
-namespace_man = cp.namespaceManager
+namespace_man = currentProgram.namespaceManager
 strcpy = None
 
-for namespace in namespace_man.getNamespacesOverlapping(AddressSet(cp.minAddress, cp.maxAddress)):
+for namespace in namespace_man.getNamespacesOverlapping(AddressSet(currentProgram.minAddress, currentProgram.maxAddress)):
     if 'strcpy' in namespace.name:
-        strcpy = fp.getFunctionAt(namespace.body.minAddress)
+        strcpy = getFunctionAt(namespace.body.minAddress)
         break
 
 if strcpy is None:
     print('Couldn\'t find strcpy')
     exit()
 
-strcpy_addr = strcpy.entryPoint
-
 char_dt = CharDataType()
 char_ptr_dt = PointerDataType(char_dt)
 
-calling_conv = cp.functionManager.defaultCallingConvention
-
+cc = currentProgram.functionManager.defaultCallingConvention
 new_params = []
 
 for dt, name in [(char_ptr_dt, 'dst'), (char_ptr_dt, 'src')]:
-    arg_loc = calling_conv.getNextArgLocation(new_params, dt, cp)
-    new_params.append(ParameterImpl(name, dt, arg_loc, cp, SourceType.USER_DEFINED))
+    arg_loc = cc.getNextArgLocation(new_params, dt, currentProgram)
+    new_params.append(ParameterImpl(name, dt, arg_loc, currentProgram, SourceType.USER_DEFINED))
 
-strcpy = fp.getFunctionAt(strcpy_addr)
 strcpy.replaceParameters(new_params, FunctionUpdateType.CUSTOM_STORAGE, True, SourceType.USER_DEFINED)
 strcpy.setReturnType(char_ptr_dt, SourceType.USER_DEFINED)
 
-for ss, ss_info in stack_strings.items():
-    asm = generate_asm(ss, ss_info['reg'], ss_info['off'], strcpy_addr)
-    blocks = get_load_bytes(asm, ss_info['start'])
+for ss in getStackStrings():
+    patch = generate_patch(ss.write_start,
+                           ss.value,
+                           ss.reg.name,
+                           ss.off,
+                           strcpy.entryPoint.offset)
 
-    max_nb = ss_info['end'] - ss_info['start'] - len(ss)
-    nb = sum([len(block[1]) for block in blocks])
+    freeSpace = ss.write_end - ss.write_start
 
-    if nb > max_nb:
-        print('Need %d bytes but only have %d' % (nb, max_nb))
-        print(hex(ss_info['start']), hex(ss_info['end']))
+    if len(patch) > freeSpace:
+        print('Couldn\'t deoptimize %s, %d bytes short' % (ss.value[:-1], len(patch) - freeSpace))
+        continue
 
-        # this is suuuuper hacky but if we don't have enough bytes, search the instruction before
-        # our stack string moving block since it might be moving a null-terminator.
-        #
-        # I just saw this in one of the cases and is super specific. What is really needed is a shorter
-        # way to strcpy.
-        insn = fp.getInstructionAt(fp.toAddr(blocks[0][0])).previous
-        pcode = insn.pcode
-        
-        if pcode[-1].opcode != PcodeOp.STORE:
-            print('Can\'t deoptimize %s' % ss)
-            continue
+    # fill the rest with nops
+    patch += [0x90] * (freeSpace - len(patch))
 
-        # emulate all the pcode up until the store
-        for pc in pcode[:-1]:
-            output = pc.output
-            value = get_pcode_value(pc)
+    #print('Deoptimizing "%s"' % ss.value[:-1])
 
-            if output is not None and type(output) != str:
-                set_varnode_value(output, value)
+    clearListing(toAddr(ss.write_start), toAddr(ss.write_end))
+    currentProgram.memory.setBytes(toAddr(ss.write_start), bytes(bytearray(patch)))
+    disassemble(toAddr(ss.write_start))
 
-        pc = pcode[-1]
-        dst = get_varnode_value(pc.getInput(1))
+    # Do some final fixups for the decompiler.
+    insn = getInstructionAt(toAddr(ss.write_start))
 
-        # this mean's that we've accessed a register. hopefully it's out stack string register
-        if type(dst) != str:
-            print('Can\'t deoptimize %s: %s not a string' % (ss[:-1], dst))
-            continue
+    while insn is not None:
+        if insn.flowType.isCall():
+            insn.setFlowOverride(FlowOverride.BRANCH)
 
-        reg, off = split_vnode_str(dst)
-        if reg is None or off is None:
-            print('Can\'t deoptimize %s: can\'t parse reg/off' % ss[:-1])
-            continue
+            stringStart = insn.address.add(insn.length)
+            clearListing(stringStart, stringStart.add(len(ss.value) - 1))
+            createAsciiString(stringStart)
 
-        # make sure that the store is touching the stack string
-        if min(ss_info['off'] + len(ss), off) - max(ss_info['off'], off) < 0:
-            # if we've reached here, it means we're at the end of our rope. no mas.
-            print('Can\'t deoptimize %s: no overlap' % ss[:-1])
-            continue
+            break
 
-        # this means that we've written to an overlapping region from our ss register
-        # relocate all of our blocks backwards
-        ss_info['start'] -= insn.length
-        blocks = get_load_bytes(asm, ss_info['start'])
-
-        max_nb = ss_info['end'] - ss_info['start'] - len(ss)
-        nb = sum([len(block[1]) for block in blocks])
-
-        # we found a lil cushion... but is it enough?
-        if nb > max_nb:
-            print('Couldn\'t deoptimize %s' % ss[:-1])
-            continue
-
-    if nb < max_nb:
-        # fill the rest with nops
-        blocks[1] = (blocks[1][0], blocks[1][1] + ([0x90] * (max_nb - nb)))
-
-    print(ss[:-1])
-
-    for off, bs in blocks:
-        patch(bs, off)
-
-    string_start_off = blocks[0][0] + len(blocks[0][1])
-    string_end_off = string_start_off + len(ss)
-
-    string_start_addr = fp.toAddr(string_start_off)
-    string_end_addr = fp.toAddr(string_end_off)
-
-    fp.clearListing(string_start_addr, string_end_addr)
-    cp.memory.setBytes(string_start_addr, ss.encode('utf-8'))
-
-    fp.createAsciiString(string_start_addr)
-    fp.disassemble(fp.toAddr(blocks[0][0]))
+        insn = insn.next
 
